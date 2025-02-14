@@ -2,7 +2,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
-from matplotlib.colors import hsv_to_rgb
+
+# TODO: implement hexagonal array, and optical axis not parallel to z axis
+# Much later: implement a scene builder interface with realtime raytracing and rendering - may need numba to speed up
+# the various calculations, or even taichi or warp to use the GPU. Rendering thousands of rays on matplotlib is also
+# slow, so maybe want to implement a shader for rendering
 
 
 class Slice:
@@ -69,11 +73,31 @@ class RectangularSlice(Slice):
         )
 
 
+class CompoundSlice(Slice):
+    def __init__(self, add_slices: list[Slice], subtract_slices: list[Slice]):
+        self.add_slices: list[Slice] = add_slices
+        self.subtract_slices: list[Slice] = subtract_slices
+
+    def in_bounds(self, xyz: np.ndarray):
+        # must hit any of the add slices and not any of the subtract slices
+        # useful for e.g. a mirror with a central hole
+        return np.any(np.stack([s.in_bounds(xyz) for s in self.add_slices], axis=1), axis=1) & ~np.any(
+            np.stack([s.in_bounds(xyz) for s in self.subtract_slices], axis=1), axis=1
+        )
+
+    def scatter(self, distance: float, concentric=False):
+        if concentric:
+            assert self.add_slices[0] is CircularSlice
+            return self.add_slices[0].scatter(distance, concentric=True)
+        else:
+            raise NotImplementedError("Hexagonal array not yet implemented")
+
+
 class Mirror:
-    def normal(self, xyz: np.ndarray):
+    def normal(self, xyz: np.ndarray) -> np.ndarray:
         raise NotImplementedError("Mirror subclasses must override this method")
 
-    def intersect(self, rays: "Rays"):
+    def intersect(self, rays: "Rays") -> np.ndarray:
         raise NotImplementedError("Mirror subclasses must override this method")
 
 
@@ -87,31 +111,35 @@ class Paraboloid(Mirror):
     def intersect(self, rays: "Rays"):
         """
         Calculates the intersection point of the rays with the paraboloid
-        This function takes a point and a unit vector as input and returns the intersection point of the ray
-        with the paraboloid. The ray is defined by the point and the direction of the unit vector.
+        This function takes a bundle of rays as input and returns the intersection point of the rays
+        with the paraboloid.
         The intersection point is calculated by solving the quadratic equation of the ray and the paraboloid.
+        The specific solution depends on whether the paraboloid is convex or concave.
         If the ray does not intersect with the paraboloid, the function returns np.nan.
-        :param root: A point that the ray passes through
-        :param direction: The unit vector that points in the direction of the ray
-        :return: The intersection point of the ray with the paraboloid
+        :param rays: A bundle of rays
+        :return: The intersection point of the rays with the paraboloid
         """
         root = rays.root
         direction = rays.direction
+        # transform coordinates to be centered on vertex
         p = root - self.v[None, :]
         xy = p[:, :2]
         z = p[:, 2]
         dxy = direction[:, :2]
         dz = direction[:, 2]
+        # symmetric about the z axis, so x and y treated together
+        # z = a r^2 -- where r^2 = x^2 + y^2, and x,y,z at parameter t = p + t*d
         a = np.sum(dxy * dxy, axis=1) * self.a
-        b = np.sum(dxy * xy, axis=1) * self.a - dz
+        b = 2.0 * np.sum(dxy * xy, axis=1) * self.a - dz
         c = np.sum(xy * xy, axis=1) * self.a - z
+        # one intersection - used when direction is parallel to z axis
         one_intn = np.zeros((root.shape[0], 2, 1))
         one_intn[...] = (-c / b)[:, None, None]
         two_intn = np.zeros((root.shape[0], 2, 1))
         discrm = b * b - 4 * a * c
         # clip the discriminant to 0 to avoid complex roots
-        two_intn[:, 0, 0] = (b - np.sqrt(discrm.clip(min=0))) / (2 * a)
-        two_intn[:, 1, 0] = (b + np.sqrt(discrm.clip(min=0))) / (2 * a)
+        two_intn[:, 0, 0] = (-b - np.sqrt(discrm.clip(min=0))) / (2 * a)
+        two_intn[:, 1, 0] = (-b + np.sqrt(discrm.clip(min=0))) / (2 * a)
         t = np.where(a[:, None, None] != 0, two_intn, one_intn)
         intn = direction[:, None] * t + p[:, None]  # Intersection point in transformed coordinates
 
@@ -127,6 +155,7 @@ class Paraboloid(Mirror):
         behind = np.logical_and(rays.rooted[:, None, None], t < 1e-6)
         t[behind] = np.inf
 
+        # Now choose the closest valid intersection
         min_t = np.min(np.where(hits[..., None], t, np.inf), axis=1)
         result = direction * min_t + root
         no_hits = ~np.any(hits & ~behind[..., 0], axis=1)
@@ -153,60 +182,66 @@ class Paraboloid(Mirror):
 
 
 class Ellipsoid(Mirror):
-    def __init__(self, near_focus: float, far_focus: float, vertex: np.ndarray, slice: Slice):
+    def __init__(self, near_focus: float, far_focus: float, solution: float, vertex: np.ndarray, slice: Slice):
         self.f1 = near_focus
         self.f2 = far_focus
-        assert np.sign(near_focus) == np.sign(far_focus)
-        self.solution = np.sign(near_focus)  # 1 for convex, -1 for concave
-        self.c = (far_focus - near_focus) / 2
-        self.a = (far_focus + near_focus) / 2
-        self.b = near_focus * far_focus
+        assert np.sign(near_focus) == np.sign(far_focus) and abs(near_focus) < abs(far_focus)
+        self.solution = -np.sign(near_focus)  # 1 for convex, -1 for concave
+        self.a = (far_focus + near_focus) / 2  # along optical axis, equivalent now to z axis
+        self.b = np.sqrt(near_focus * far_focus)
+        self.c = np.copy(vertex)
+        self.c[2] += self.a
         self.v = vertex
         self.slice = slice
 
     def intersect(self, rays: "Rays"):
         """
-        Calculates the intersection point of the rays with the paraboloid
-        This function takes a point and a unit vector as input and returns the intersection point of the ray
-        with the paraboloid. The ray is defined by the point and the direction of the unit vector.
-        The intersection point is calculated by solving the quadratic equation of the ray and the paraboloid.
-        If the ray does not intersect with the paraboloid, the function returns np.nan.
-        :param root: A point that the ray passes through
-        :param direction: The unit vector that points in the direction of the ray
-        :return: The intersection point of the ray with the paraboloid
+        Calculates the intersection point of the rays with the ellipsoid
+        This function takes a bundle of rays as input and returns the intersection point of the rays
+        with the ellipsoid.
+        The intersection point is calculated by solving the quadratic equation of the ray and the ellipsoid.
+        The specific solution depends on whether the ellipsoid is convex or concave.
+        If the ray does not intersect with the ellipsoid, the function returns np.nan.
+        :param rays: A point that the ray passes through
+        :return: The intersection point of the ray with the ellipsoid
         """
         root = rays.root
         direction = rays.direction
-        p = root - self.v[None, :]
+        # transform coordinates to be centered on ellipsoid's center
+        # This makes it easier to select the convex or concave case (simply filter z > 0 or z < 0)
+        p = root - self.c[None, :]
         xy = p[:, :2]
         z = p[:, 2]
         dxy = direction[:, :2]
         dz = direction[:, 2]
-        a = np.sum(dxy * dxy, axis=1) * self.a
-        b = np.sum(dxy * xy, axis=1) * self.a - dz
-        c = np.sum(xy * xy, axis=1) * self.a - z
-        one_intn = np.zeros((root.shape[0], 2, 1))
-        one_intn[...] = (-c / b)[:, None, None]
-        two_intn = np.zeros((root.shape[0], 2, 1))
+        # symmetric about the z axis, so x and y treated together
+        # 1 = z^2/b^2 + r^2/a^2 -- where r^2 = x^2 + y^2, and x,y,z at parameter t = p + t*d
+        a = np.sum(dxy * dxy, axis=1) / self.b**2 + np.square(dz) / self.a**2
+        b = 2.0 * (np.sum(dxy * xy, axis=1) / self.b**2 + dz * z / self.a**2)
+        c = np.sum(xy * xy, axis=1) / self.b**2 + np.square(z) / self.a**2 - 1.0
+        # single intersection case is not needed since ellipsoid is a closed surface, always 2 intersections (may be
+        # degenerate)
+        t = np.zeros((root.shape[0], 2, 1))
         discrm = b * b - 4 * a * c
         # clip the discriminant to 0 to avoid complex roots
-        two_intn[:, 0, 0] = (b - np.sqrt(discrm.clip(min=0))) / (2 * a)
-        two_intn[:, 1, 0] = (b + np.sqrt(discrm.clip(min=0))) / (2 * a)
-        t = np.where(a[:, None, None] != 0, two_intn, one_intn)
+        t[:, 0, 0] = (-b - np.sqrt(discrm.clip(min=0))) / (2 * a)
+        t[:, 1, 0] = (-b + np.sqrt(discrm.clip(min=0))) / (2 * a)
         intn = direction[:, None] * t + p[:, None]  # Intersection point in transformed coordinates
 
         # setting all coordinates to infinity where the discriminant is negative should ensure it misses the slice
         intn[discrm < 0, :] = np.inf
+        # if the sign of the solution doesn't match the convexity of the ellipsoid, ensure it misses the slice
+        correct_sign = np.sign(intn[..., 2]) == self.solution
+        intn[~correct_sign, :] = np.inf
 
-        # Note that if direction is parallel to z, t will have only one solution, but we will return a duplicate so
-        # that the dimensions match
-        all_xyz = intn + self.v[None, None]
+        all_xyz = intn + self.c[None, None]
         hits = self.slice.in_bounds(all_xyz)
 
         # if the ray would hit the paraboloid at negative t but is already rooted, ignore it (with a small tolerance)
         behind = np.logical_and(rays.rooted[:, None, None], t < 1e-6)
         t[behind] = np.inf
 
+        # Now choose the closest valid intersection
         min_t = np.min(np.where(hits[..., None], t, np.inf), axis=1)
         result = direction * min_t + root
         no_hits = ~np.any(hits & ~behind[..., 0], axis=1)
@@ -215,21 +250,143 @@ class Ellipsoid(Mirror):
 
     def normal(self, xyz):
         """
-        Calculates the normal vector at a given point on the paraboloid.
+        Calculates the normal vector at a given point on the ellipsoid.
 
         :param xyz: The point at which to calculate the normal vector
         :return: The normal vector at the given point
         """
-        # gradient of the level set of the paraboloid is always perpendicular to surface
-        # level set of paraboloid is f(x, y, z) = 0 = z - a(x^2 + y^2)
+        # gradient of the level set of the ellipsoid is always perpendicular to surface
+        # level set of ellipsoid is f(x, y, z) = 1 = z^2/a^2 + r^2/b^2
         # intuition: moving along tangent plane gives a change of 0 in f, thus the gradient of f must be perpendicular
         # alternative: changing value of f is steepest along the direction perpendicular, each level set is a nested
-        # paraboloid inside or outside of the one defined here.
-        p = xyz - self.v
-        grad_f = -2 * self.a * p
-        grad_f[:, 2] = 1.0
-        grad_f /= np.linalg.norm(grad_f, axis=1, keepdims=True)  # This will divide by nan if rays missed mirror
+        # ellipsoid inside or outside of the one defined here.
+        p = xyz - self.c  # broadcasting happens because last dimension matches
+        scale = np.array([self.b**2, self.b**2, self.a**2])
+        grad_f = self.solution * 2 * p / scale  # direction of normal vector doesn't *really* matter, but nice to have
+        grad_f /= np.linalg.norm(grad_f, axis=1, keepdims=True)
         return grad_f
+
+
+class Hyperboloid(Mirror):
+    def __init__(self, front_focus: float, rear_focus: float, vertex: np.ndarray, slice: Slice):
+        self.f1 = front_focus
+        self.f2 = rear_focus
+        # front focus always positive, rear focus always negative
+        # either being 0 is a terrible way to define a line segment, unsupported
+        assert np.sign(front_focus) > 0 and np.sign(rear_focus) < 0
+        # if front_focus is shorter than rear focus, use +ve z solution, otherwise -ve
+        # solution is in a way opposite to ellipsoid
+        a = (front_focus + rear_focus) / 2
+        self.solution = -np.sign(a)
+        assert self.solution != 0.0  # a terrible way to define a plane, unsupported
+        self.a = abs(a)
+        self.b = np.sqrt(0.25 * (front_focus - rear_focus) ** 2 - a**2)
+        self.c = np.copy(vertex)
+        self.c[2] += a
+        self.v = vertex
+        self.slice = slice
+
+    def intersect(self, rays: "Rays"):
+        """
+        Calculates the intersection point of the rays with the hyperboloid
+        This function takes a bundle of rays as input and returns the intersection point of the rays
+        with the hyperboloid.
+        The intersection point is calculated by solving the quadratic equation of the ray and the hyperboloid.
+        The specific solution depends on whether the hyperboloid is convex or concave.
+        If the ray does not intersect with the hyperboloid, the function returns np.nan.
+        :param rays: A point that the ray passes through
+        :return: The intersection point of the ray with the hyperboloid
+        """
+        root = rays.root
+        direction = rays.direction
+        # transform coordinates to be centered on hyperboloid's center
+        # This makes it easier to select the convex or concave case (simply filter z > 0 or z < 0)
+        p = root - self.c[None, :]
+        xy = p[:, :2]
+        z = p[:, 2]
+        dxy = direction[:, :2]
+        dz = direction[:, 2]
+        # symmetric about the z axis, so x and y treated together
+        # 0 = 1 - z^2/a^2 + r^2/b^2 -- where r^2 = x^2 + y^2, and x,y,z at parameter t => p + t*d
+        a = np.sum(dxy * dxy, axis=1) / self.b**2 - np.square(dz) / self.a**2
+        b = 2.0 * (np.sum(dxy * xy, axis=1) / self.b**2 - dz * z / self.a**2)
+        c = np.sum(xy * xy, axis=1) / self.b**2 - np.square(z) / self.a**2 + 1.0
+        # single intersection case is not needed since hyperboloid always has 2 intersections (may be degenerate)
+        t = np.zeros((root.shape[0], 2, 1))
+        discrm = b * b - 4 * a * c
+        # clip the discriminant to 0 to avoid complex roots
+        t[:, 0, 0] = (-b - np.sqrt(discrm.clip(min=0))) / (2 * a)
+        t[:, 1, 0] = (-b + np.sqrt(discrm.clip(min=0))) / (2 * a)
+        intn = direction[:, None] * t + p[:, None]  # Intersection point in transformed coordinates
+
+        # setting all coordinates to infinity where the discriminant is negative should ensure it misses the slice
+        intn[discrm < 0, :] = np.inf
+        # if the sign of the solution doesn't match the convexity of the hyperboloid, ensure it misses the slice
+        correct_sign = np.sign(intn[..., 2]) == self.solution
+        intn[~correct_sign, :] = np.inf
+
+        all_xyz = intn + self.c[None, None]
+        hits = self.slice.in_bounds(all_xyz)
+
+        # if the ray would hit the paraboloid at negative t but is already rooted, ignore it (with a small tolerance)
+        behind = np.logical_and(rays.rooted[:, None, None], t < 1e-6)
+        t[behind] = np.inf
+
+        # Now choose the closest valid intersection
+        min_t = np.min(np.where(hits[..., None], t, np.inf), axis=1)
+        result = direction * min_t + root
+        no_hits = ~np.any(hits & ~behind[..., 0], axis=1)
+        result[no_hits, :] = np.nan
+        return result
+
+    def normal(self, xyz):
+        """
+        Calculates the normal vector at a given point on the hyperboloid.
+
+        :param xyz: The point at which to calculate the normal vector
+        :return: The normal vector at the given point
+        """
+        # gradient of the level set of the hyperboloid is always perpendicular to surface
+        # level set of hyperboloid is f(x, y, z) = -1 = -z^2/a^2 + r^2/b^2
+        # intuition: moving along tangent plane gives a change of 0 in f, thus the gradient of f must be perpendicular
+        # alternative: changing value of f is steepest along the direction perpendicular, each level set is a nested
+        # hyperboloid inside or outside of the one defined here.
+        p = xyz - self.c  # broadcasting happens because last dimension matches
+        scale = np.array([self.b**2, self.b**2, -self.a**2])  # note -ve sign on z
+        grad_f = self.solution * 2 * p / scale  # direction of normal vector doesn't *really* matter, but nice to have
+        grad_f /= np.linalg.norm(grad_f, axis=1, keepdims=True)
+        return grad_f
+
+
+class ConicSection(Mirror):
+    def __init__(self, K: np.ndarray, near_focus: float, vertex: np.ndarray, slice: Slice):
+        K = abs(K)
+        e = np.sqrt(K)  # forget about oblate ellipsoids for now
+        if K == 1.0:
+            self.mirror = Paraboloid(near_focus, vertex, slice)
+        elif K < 1.0:
+            # we assume that the focal length provided is the one that's nearer to the vertex
+            # a = c + f and a = c / e, so:
+            c = near_focus / (1.0 / e - 1.0)
+            f2 = c - near_focus  # mirrored about the center
+            self.mirror = Ellipsoid(near_focus, f2, vertex, slice)
+        else:
+            # a = c - f and a = c / e, so:
+            c = near_focus / (1.0 - 1.0 / e)
+            if near_focus > 0:
+                # we need to find the further focal length
+                pos = near_focus
+                neg = -c - near_focus  # mirrored about the center
+            else:
+                neg = near_focus
+                pos = -c - near_focus  # mirrored about the center
+            self.mirror = Hyperboloid(pos, neg, vertex, slice)
+
+    def intersect(self, rays: "Rays"):
+        return self.mirror.intersect(rays)
+
+    def normal(self, xyz):
+        return self.mirror.normal(xyz)
 
 
 class Plane(Mirror):
@@ -424,45 +581,3 @@ class Simulation:
         ax.set_xlim(detector_plane.slice.xmin, detector_plane.slice.xmax)
         ax.set_ylim(detector_plane.slice.ymin, detector_plane.slice.ymax)
         plt.show()
-
-
-def main():
-    f = 3.0
-    a = 1 / (4 * f)
-    r = 0.5
-    h = r**2 * a
-
-    s = 0.015  # sensor size
-
-    primary_slice = CircularSlice(r, np.array([0.0, 0.0, 0.0]))
-    primary = Paraboloid(f, np.array([0.0, 0.0, 0.0]), primary_slice)
-    detector_slice = RectangularSlice(-s, s, -s, s)
-    detector = Plane(np.array([0.0, 0.0, f]), np.array([0.0, 0.0, -1.0]), detector_slice)
-
-    sim = Simulation(BoundingBox(np.array([-r, -r, -1.0]), np.array([r, r, max(h, f) * 1.5])), [primary, detector])
-
-    mirror_scatter = primary_slice.scatter(0.0049, concentric=True)
-
-    colours = hsv_to_rgb(
-        np.stack(
-            (
-                (np.arctan2(mirror_scatter[:, 1], mirror_scatter[:, 0]) / np.pi * 0.5) % 1.0,
-                np.linalg.norm(mirror_scatter[:, :2], axis=1) / primary_slice.r,
-                np.linalg.norm(mirror_scatter[:, :2], axis=1) / primary_slice.r * 0.8 + 0.2,
-            ),
-            axis=1,
-        )
-    )
-
-    off_center_angle = np.arctan(1 / 235.0)
-    incid_roots = np.concatenate((mirror_scatter, np.full((mirror_scatter.shape[0], 1), 5.0)), axis=1)
-    incid_rays = Rays(incid_roots, np.array([0, 0, -1.0]))
-    off_ax_roots = primary.intersect(incid_rays)  # This does not modify incident rays, only reflect does
-    off_ax_rays = Rays(off_ax_roots, np.array([off_center_angle, 0, -1.0]))
-    sources = [incid_rays, off_ax_rays]
-    sim.trace(sources)
-    sim.render(len(sources), detector, np.array([0.0, 1.0, 0.0]), colours)
-
-
-if __name__ == "__main__":
-    main()
