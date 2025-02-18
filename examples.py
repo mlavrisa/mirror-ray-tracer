@@ -71,7 +71,7 @@ def ritchey_chretien():
 
     h = 2.0
 
-    s = 0.065  # sensor size
+    s = 0.045  # sensor size
 
     primary_slice = CircularSlice(r1, np.array([0.0, 0.0, 0.0]))
     primary = ConicSection(k1, f1, np.array([0.0, 0.0, 0.0]), primary_slice)
@@ -100,7 +100,7 @@ def ritchey_chretien():
     off_center_angle = np.arctan(1 / 235.0)
     incid_roots = np.concatenate((mirror_scatter, np.full((mirror_scatter.shape[0], 1), 5.0)), axis=1)
     incid_rays = Rays(incid_roots, np.array([0, 0, -1.0]))
-    off_ax_roots = primary.intersect(incid_rays)  # This does not modify incident rays, only reflect does
+    _, off_ax_roots = primary.intersect(incid_rays)  # This does not modify incident rays, only reflect does
     off_ax_rays = Rays(off_ax_roots, np.array([off_center_angle, 0, -1.0]))
     sources = [incid_rays, off_ax_rays]
     sim.trace(sources)

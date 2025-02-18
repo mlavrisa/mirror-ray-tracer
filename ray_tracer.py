@@ -160,7 +160,7 @@ class Paraboloid(Mirror):
         result = direction * min_t + root
         no_hits = ~np.any(hits & ~behind[..., 0], axis=1)
         result[no_hits, :] = np.nan
-        return result
+        return min_t.ravel(), result
 
     def normal(self, xyz):
         """
@@ -246,7 +246,7 @@ class Ellipsoid(Mirror):
         result = direction * min_t + root
         no_hits = ~np.any(hits & ~behind[..., 0], axis=1)
         result[no_hits, :] = np.nan
-        return result
+        return min_t.ravel(), result
 
     def normal(self, xyz):
         """
@@ -337,7 +337,7 @@ class Hyperboloid(Mirror):
         result = direction * min_t + root
         no_hits = ~np.any(hits & ~behind[..., 0], axis=1)
         result[no_hits, :] = np.nan
-        return result
+        return min_t.ravel(), result
 
     def normal(self, xyz):
         """
@@ -412,7 +412,8 @@ class Plane(Mirror):
         new_xyz = direction * t[:, None] + xyz
         hits = self.slice.in_bounds(new_xyz[:, None])
         no_hit = np.full_like(xyz, np.nan)
-        return np.where(hits, new_xyz, no_hit)
+        t[~hits.ravel()] = np.inf
+        return t, np.where(hits, new_xyz, no_hit)
 
     def normal(self, xyz: np.ndarray):
         """
@@ -427,12 +428,16 @@ class Plane(Mirror):
 class Rays:
     def __init__(self, root: np.ndarray, direction: np.ndarray, rooted: np.ndarray = None):
         """
-        Initializes a Rays object with the given root and direction.
+        Initializes the Rays object with the specified root, direction, and optionally rooted status.
 
-        The direction vector is normalized to ensure it has a unit length.
+        This constructor sets up the initial state of the rays, including their starting positions,
+        normalized directions, and various attributes to track their interactions with objects.
 
-        :param root: The starting points of the rays
-        :param direction: The direction vectors of the rays
+        :param root: The starting positions of the rays, as a 2D numpy array with shape (n, 3).
+        :param direction: The direction vectors of the rays, as a 2D numpy array with shape (n, 3)
+                        or a 1D numpy array to be broadcasted to all roots.
+        :param rooted: Optional boolean array indicating whether each ray is initially rooted.
+                    If not provided, all rays are initialized as unrooted.
         """
         self.root = root
         if direction.ndim == 1:
@@ -444,19 +449,26 @@ class Rays:
         else:
             self.rooted = rooted
         self.terminates = np.full_like(self.rooted, False)
+        self.min_t = np.full_like(self.rooted, np.inf, dtype=float)
+        self.blocked_terminus = np.full_like(self.root, np.nan)
 
     def reflect(self, mirror: Mirror):
         """
-        Reflects the rays off the mirror, returning a new Rays object
+        Reflects the rays off the given mirror and returns the resulting reflected rays.
 
-        Mirror is an object with an intersect method that takes a point and a direction
-        and returns the intersection point of the ray with the mirror, and a normal method
-        that takes a point and returns the normal vector of the mirror at the point.
+        This function calculates the intersection of the rays with the given mirror, determines if any rays are
+        blocked, and updates their terminus and termination status. It then calculates the new direction for the rays
+        based on the mirror's normal at the intersection points and returns the reflected rays.
 
-        :param mirror: Mirror to reflect the rays off
-        :return: New Rays object with the reflected rays
+        :param mirror: The mirror object that the rays will reflect off.
+        :return: A new Rays object representing the reflected rays.
         """
-        new_root = mirror.intersect(self)
+        mirror_t, new_root = mirror.intersect(self)
+
+        # figure out if any of the rays were blocked
+        is_blocked = mirror_t > self.min_t
+        self.terminus[is_blocked, :] = self.blocked_terminus[is_blocked, :]
+        self.terminates = ~np.any(np.isnan(self.terminus), axis=1)
 
         # Only set the terminus for rays that haven't already terminated, usually the ones that were blocked
         new_root[self.terminates, :] = np.nan
@@ -467,18 +479,21 @@ class Rays:
         new_direction = self.direction - 2.0 * np.sum(normals * self.direction, axis=1, keepdims=True) * normals
         return Rays(new_root, new_direction, self.terminates)
 
-    def block(self, mirror: Mirror):
+    def test_block(self, object: Mirror):
         """
-        Calculates which rays would be blocked by a mirror, e.g. for checking incoming rays against the secondary
+        Tests if the rays are blocked by an object (mirror) and if this is the earliest the ray currently intersects
+        with anything, updates the blocked terminus and minimum intersection parameter.
 
-        For each ray, this function determines where it intersects with the given mirror
-        and updates the terminus of the ray to that point. If a ray does not intersect
-        the mirror, its direction is set to NaN to indicate it is blocked.
+        This function computes the intersection of the rays with the given object, checks if the intersection occurs
+        before any previously found intersections, and updates the blocked terminus and minimum intersection time
+        accordingly.
 
-        :param mirror: Mirror object to test intersections with, providing intersect and normal methods
+        :param object: The mirror object to test against the rays.
         """
-        self.terminus[...] = mirror.intersect(self)
-        self.terminates = ~np.any(np.isnan(self.terminus), axis=1)
+        t, root = object.intersect(self)
+        less_than = t < self.min_t
+        self.blocked_terminus[less_than, :] = root[less_than, :]
+        self.min_t = np.minimum(self.min_t, t)
 
 
 class BoundingBox:
@@ -487,6 +502,25 @@ class BoundingBox:
         self.max = max
 
     def bound_rays(self, rays: Rays):
+        """
+        Binds the given rays to the bounding box by finding the intersections with the box and updating the root and
+        terminus of the rays accordingly.
+
+        The bounding box is described by its minimum and maximum coordinates. The function computes the intersection of
+        the rays with the box by finding the intersection of the ray lines with the box's edges.
+
+        The intersection is described by a parameter t, which is the parameter of the ray equation such that t = 0
+        is the root of the ray and t = 1 is one unit along the direction of the ray.
+
+        The function then computes the "away" and "towards" matrices, which describe whether the ray is heading away
+        from a face or towards it. The away matrix is used to find the root of the ray within the box, and the towards
+        matrix is used to find the terminus of the ray within the box.
+
+        The function then updates the root and terminus of the rays by taking the maximum of the possible roots and the
+        minimum of the possible termini.
+
+        :param rays: The rays to be bounded.
+        """
         bounds = np.concatenate((np.diag(self.min), np.diag(self.max)), axis=0)[None]
         norms = np.concatenate((np.eye(3), -np.eye(3)), axis=0)
 
@@ -506,6 +540,7 @@ class BoundingBox:
         new_termini = rays.root + rays.direction * possible_termini[:, None]
         rays.root = np.where(rays.rooted[:, None], rays.root, new_roots)
         rays.terminus = np.where(rays.terminates[:, None], rays.terminus, new_termini)
+        # rays must always terminate
         rays.rooted[...] = True
         rays.terminates[...] = True
 
@@ -522,7 +557,7 @@ class Simulation:
             for jdx, source in enumerate(propagate):
                 if idx < len(self.objects) - 1:
                     for blocker in self.objects[idx + 1 :]:
-                        source.block(blocker)
+                        source.test_block(blocker)
                 propagate[jdx] = source.reflect(obj)
                 self.bounding_box.bound_rays(source)
                 self.finished_rays.append(source)
