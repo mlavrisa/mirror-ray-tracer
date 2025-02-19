@@ -1,15 +1,53 @@
-import numpy as np
+import time
+
 import matplotlib.pyplot as plt
+import numpy as np
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
+from rendering import VisualizerApp
 
-# TODO: implement hexagonal array, and optical axis not parallel to z axis
-# Much later: implement a scene builder interface with realtime raytracing and rendering - may need numba to speed up
-# the various calculations, or even taichi or warp to use the GPU. Rendering thousands of rays on matplotlib is also
-# slow, so maybe want to implement a shader for rendering
+has_gpu = False
+
+try:
+    import cupy as cp
+
+    if cp.cuda.runtime.getDeviceCount() == 0:
+        raise ValueError
+    has_gpu = True
+    print("Warning: GPU implementation is experimental, and currently slow")
+except ImportError:
+    cp = None
+    print("No cupy installation found, using numpy")
+except ValueError:
+    cp = None
+    print("No GPU found, using numpy")
+
+# TODO: Implement hexagonal array, and optical axis of conic section mirrors not parallel to z axis
+# TODO: Fix cupy implementation, currently too much overhead shifting arrays between cpu and gpu
+# Much later: add full interface for modifying the simulation parameters in real time
+
+
+def to_cpu(array):
+    if cp is None:
+        return array
+    return array.get() if isinstance(array, cp.ndarray) else array
+
+
+def to_gpu(array):
+    if cp is None:
+        return array
+    return cp.asarray(array) if isinstance(array, np.ndarray) else array
 
 
 class Slice:
+    use_gpu = False
+
+    def to_gpu(self):
+        raise NotImplementedError("Slice subclasses must override this method")
+
+    def to_cpu(self):
+        raise NotImplementedError("Slice subclasses must override this method")
+
     def in_bounds(self, xyz: np.ndarray):
         raise NotImplementedError("Slice subclasses must override this method")
 
@@ -21,6 +59,15 @@ class CircularSlice(Slice):
     def __init__(self, radius: float, center: np.ndarray):
         self.r = radius
         self.c = center
+        self.use_gpu = False
+
+    def to_gpu(self):
+        self.use_gpu = True
+        self.c = to_gpu(self.c)
+
+    def to_cpu(self):
+        self.use_gpu = False
+        self.c = to_cpu(self.c)
 
     def in_bounds(self, xyz: np.ndarray):
         """
@@ -29,7 +76,8 @@ class CircularSlice(Slice):
         :param xyz: 3D coordinates of points to test
         :return: Boolean array of same shape as `xyz` indicating whether each point is within the bounds
         """
-        return np.square(xyz[..., :2] - self.c[None, None, :2]).sum(axis=-1) <= np.square(self.r)
+        xp = cp if self.use_gpu and has_gpu else np
+        return xp.square(xyz[..., :2] - self.c[None, None, :2]).sum(axis=-1) <= xp.square(self.r)
 
     def scatter(self, distance: float, concentric=False):
         """
@@ -52,6 +100,7 @@ class CircularSlice(Slice):
                 angles = np.arange(num_pts) * delta + (idx % 2) * delta * 0.5
                 pts = np.concatenate((pts, rad * np.stack((np.cos(angles), np.sin(angles)), axis=1)), axis=0)
                 # pts = rad * np.stack((np.cos(angles), np.sin(angles)), axis=1)
+                pts += self.c[:2]
             return pts
         else:
             raise NotImplementedError("Hexagonal array not yet implemented")
@@ -63,6 +112,13 @@ class RectangularSlice(Slice):
         self.xmax = xmax
         self.ymin = ymin
         self.ymax = ymax
+        self.use_gpu = False  # not actually needed, but here for consistency
+
+    def to_gpu(self):
+        self.use_gpu = True
+
+    def to_cpu(self):
+        self.use_gpu = False
 
     def in_bounds(self, xyz: np.ndarray):
         return (
@@ -77,12 +133,28 @@ class CompoundSlice(Slice):
     def __init__(self, add_slices: list[Slice], subtract_slices: list[Slice]):
         self.add_slices: list[Slice] = add_slices
         self.subtract_slices: list[Slice] = subtract_slices
+        self.use_gpu = False
+
+    def to_gpu(self):
+        self.use_gpu = True
+        for s in self.add_slices:
+            s.to_gpu()
+        for s in self.subtract_slices:
+            s.to_gpu()
+
+    def to_cpu(self):
+        self.use_gpu = False
+        for s in self.add_slices:
+            s.to_cpu()
+        for s in self.subtract_slices:
+            s.to_cpu()
 
     def in_bounds(self, xyz: np.ndarray):
         # must hit any of the add slices and not any of the subtract slices
         # useful for e.g. a mirror with a central hole
-        return np.any(np.stack([s.in_bounds(xyz) for s in self.add_slices], axis=1), axis=1) & ~np.any(
-            np.stack([s.in_bounds(xyz) for s in self.subtract_slices], axis=1), axis=1
+        xp = cp if self.use_gpu and has_gpu else np
+        return xp.any(xp.stack([s.in_bounds(xyz) for s in self.add_slices], axis=1), axis=1) & ~xp.any(
+            xp.stack([s.in_bounds(xyz) for s in self.subtract_slices], axis=1), axis=1
         )
 
     def scatter(self, distance: float, concentric=False):
@@ -94,6 +166,14 @@ class CompoundSlice(Slice):
 
 
 class Mirror:
+    use_gpu = False
+
+    def to_gpu(self):
+        raise NotImplementedError("Mirror subclasses must override this method")
+
+    def to_cpu(self):
+        raise NotImplementedError("Mirror subclasses must override this method")
+
     def normal(self, xyz: np.ndarray) -> np.ndarray:
         raise NotImplementedError("Mirror subclasses must override this method")
 
@@ -107,6 +187,17 @@ class Paraboloid(Mirror):
         self.a = 1 / (4 * self.f)
         self.v = vertex
         self.slice = slice
+        self.use_gpu = False
+
+    def to_gpu(self):
+        self.use_gpu = True
+        self.v = to_gpu(self.v)
+        self.slice.to_gpu()
+
+    def to_cpu(self):
+        self.use_gpu = False
+        self.v = to_cpu(self.v)
+        self.slice.to_cpu()
 
     def intersect(self, rays: "Rays"):
         """
@@ -115,10 +206,11 @@ class Paraboloid(Mirror):
         with the paraboloid.
         The intersection point is calculated by solving the quadratic equation of the ray and the paraboloid.
         The specific solution depends on whether the paraboloid is convex or concave.
-        If the ray does not intersect with the paraboloid, the function returns np.nan.
+        If the ray does not intersect with the paraboloid, the function returns nan.
         :param rays: A bundle of rays
         :return: The intersection point of the rays with the paraboloid
         """
+        xp = cp if self.use_gpu and has_gpu else np
         root = rays.root
         direction = rays.direction
         # transform coordinates to be centered on vertex
@@ -129,22 +221,22 @@ class Paraboloid(Mirror):
         dz = direction[:, 2]
         # symmetric about the z axis, so x and y treated together
         # z = a r^2 -- where r^2 = x^2 + y^2, and x,y,z at parameter t = p + t*d
-        a = np.sum(dxy * dxy, axis=1) * self.a
-        b = 2.0 * np.sum(dxy * xy, axis=1) * self.a - dz
-        c = np.sum(xy * xy, axis=1) * self.a - z
+        a = xp.sum(dxy * dxy, axis=1) * self.a
+        b = 2.0 * xp.sum(dxy * xy, axis=1) * self.a - dz
+        c = xp.sum(xy * xy, axis=1) * self.a - z
         # one intersection - used when direction is parallel to z axis
-        one_intn = np.zeros((root.shape[0], 2, 1))
+        one_intn = xp.zeros((root.shape[0], 2, 1))
         one_intn[...] = (-c / b)[:, None, None]
-        two_intn = np.zeros((root.shape[0], 2, 1))
+        two_intn = xp.zeros((root.shape[0], 2, 1))
         discrm = b * b - 4 * a * c
         # clip the discriminant to 0 to avoid complex roots
-        two_intn[:, 0, 0] = (-b - np.sqrt(discrm.clip(min=0))) / (2 * a)
-        two_intn[:, 1, 0] = (-b + np.sqrt(discrm.clip(min=0))) / (2 * a)
-        t = np.where(a[:, None, None] != 0, two_intn, one_intn)
+        two_intn[:, 0, 0] = (-b - xp.sqrt(discrm.clip(min=0))) / (2 * a)
+        two_intn[:, 1, 0] = (-b + xp.sqrt(discrm.clip(min=0))) / (2 * a)
+        t = xp.where(a[:, None, None] != 0, two_intn, one_intn)
         intn = direction[:, None] * t + p[:, None]  # Intersection point in transformed coordinates
 
         # setting all coordinates to infinity where the discriminant is negative should ensure it misses the slice
-        intn[discrm < 0, :] = np.inf
+        intn[discrm < 0, :] = xp.inf
 
         # Note that if direction is parallel to z, t will have only one solution, but we will return a duplicate so
         # that the dimensions match
@@ -152,14 +244,14 @@ class Paraboloid(Mirror):
         hits = self.slice.in_bounds(all_xyz)
 
         # if the ray would hit the paraboloid at negative t but is already rooted, ignore it (with a small tolerance)
-        behind = np.logical_and(rays.rooted[:, None, None], t < 1e-6)
-        t[behind] = np.inf
+        behind = xp.logical_and(rays.rooted[:, None, None], t < 1e-6)
+        t[behind] = xp.inf
 
         # Now choose the closest valid intersection
-        min_t = np.min(np.where(hits[..., None], t, np.inf), axis=1)
+        min_t = xp.min(xp.where(hits[..., None], t, xp.inf), axis=1)
         result = direction * min_t + root
-        no_hits = ~np.any(hits & ~behind[..., 0], axis=1)
-        result[no_hits, :] = np.nan
+        no_hits = ~xp.any(hits & ~behind[..., 0], axis=1)
+        result[no_hits, :] = xp.nan
         return min_t.ravel(), result
 
     def normal(self, xyz):
@@ -174,10 +266,11 @@ class Paraboloid(Mirror):
         # intuition: moving along tangent plane gives a change of 0 in f, thus the gradient of f must be perpendicular
         # alternative: changing value of f is steepest along the direction perpendicular, each level set is a nested
         # paraboloid inside or outside of the one defined here.
+        xp = cp if self.use_gpu and has_gpu else np
         p = xyz - self.v
         grad_f = -2 * self.a * p
         grad_f[:, 2] = 1.0
-        grad_f /= np.linalg.norm(grad_f, axis=1, keepdims=True)  # This will divide by nan if rays missed mirror
+        grad_f /= xp.linalg.norm(grad_f, axis=1, keepdims=True)  # This will divide by nan if rays missed mirror
         return grad_f
 
 
@@ -193,6 +286,19 @@ class Ellipsoid(Mirror):
         self.c[2] += self.a
         self.v = vertex
         self.slice = slice
+        self.use_gpu = False
+
+    def to_gpu(self):
+        self.use_gpu = True
+        self.v = to_gpu(self.v)
+        self.c = to_gpu(self.c)
+        self.slice.to_gpu()
+
+    def to_cpu(self):
+        self.use_gpu = False
+        self.v = to_cpu(self.v)
+        self.c = to_cpu(self.c)
+        self.slice.to_cpu()
 
     def intersect(self, rays: "Rays"):
         """
@@ -201,10 +307,11 @@ class Ellipsoid(Mirror):
         with the ellipsoid.
         The intersection point is calculated by solving the quadratic equation of the ray and the ellipsoid.
         The specific solution depends on whether the ellipsoid is convex or concave.
-        If the ray does not intersect with the ellipsoid, the function returns np.nan.
+        If the ray does not intersect with the ellipsoid, the function returns xp.nan.
         :param rays: A point that the ray passes through
         :return: The intersection point of the ray with the ellipsoid
         """
+        xp = cp if self.use_gpu and has_gpu else np
         root = rays.root
         direction = rays.direction
         # transform coordinates to be centered on ellipsoid's center
@@ -216,36 +323,36 @@ class Ellipsoid(Mirror):
         dz = direction[:, 2]
         # symmetric about the z axis, so x and y treated together
         # 1 = z^2/b^2 + r^2/a^2 -- where r^2 = x^2 + y^2, and x,y,z at parameter t = p + t*d
-        a = np.sum(dxy * dxy, axis=1) / self.b**2 + np.square(dz) / self.a**2
-        b = 2.0 * (np.sum(dxy * xy, axis=1) / self.b**2 + dz * z / self.a**2)
-        c = np.sum(xy * xy, axis=1) / self.b**2 + np.square(z) / self.a**2 - 1.0
+        a = xp.sum(dxy * dxy, axis=1) / self.b**2 + xp.square(dz) / self.a**2
+        b = 2.0 * (xp.sum(dxy * xy, axis=1) / self.b**2 + dz * z / self.a**2)
+        c = xp.sum(xy * xy, axis=1) / self.b**2 + xp.square(z) / self.a**2 - 1.0
         # single intersection case is not needed since ellipsoid is a closed surface, always 2 intersections (may be
         # degenerate)
-        t = np.zeros((root.shape[0], 2, 1))
+        t = xp.zeros((root.shape[0], 2, 1))
         discrm = b * b - 4 * a * c
         # clip the discriminant to 0 to avoid complex roots
-        t[:, 0, 0] = (-b - np.sqrt(discrm.clip(min=0))) / (2 * a)
-        t[:, 1, 0] = (-b + np.sqrt(discrm.clip(min=0))) / (2 * a)
+        t[:, 0, 0] = (-b - xp.sqrt(discrm.clip(min=0))) / (2 * a)
+        t[:, 1, 0] = (-b + xp.sqrt(discrm.clip(min=0))) / (2 * a)
         intn = direction[:, None] * t + p[:, None]  # Intersection point in transformed coordinates
 
         # setting all coordinates to infinity where the discriminant is negative should ensure it misses the slice
-        intn[discrm < 0, :] = np.inf
+        intn[discrm < 0, :] = xp.inf
         # if the sign of the solution doesn't match the convexity of the ellipsoid, ensure it misses the slice
-        correct_sign = np.sign(intn[..., 2]) == self.solution
-        intn[~correct_sign, :] = np.inf
+        correct_sign = xp.sign(intn[..., 2]) == self.solution
+        intn[~correct_sign, :] = xp.inf
 
         all_xyz = intn + self.c[None, None]
         hits = self.slice.in_bounds(all_xyz)
 
         # if the ray would hit the paraboloid at negative t but is already rooted, ignore it (with a small tolerance)
-        behind = np.logical_and(rays.rooted[:, None, None], t < 1e-6)
-        t[behind] = np.inf
+        behind = xp.logical_and(rays.rooted[:, None, None], t < 1e-6)
+        t[behind] = xp.inf
 
         # Now choose the closest valid intersection
-        min_t = np.min(np.where(hits[..., None], t, np.inf), axis=1)
+        min_t = xp.min(xp.where(hits[..., None], t, xp.inf), axis=1)
         result = direction * min_t + root
-        no_hits = ~np.any(hits & ~behind[..., 0], axis=1)
-        result[no_hits, :] = np.nan
+        no_hits = ~xp.any(hits & ~behind[..., 0], axis=1)
+        result[no_hits, :] = xp.nan
         return min_t.ravel(), result
 
     def normal(self, xyz):
@@ -260,10 +367,11 @@ class Ellipsoid(Mirror):
         # intuition: moving along tangent plane gives a change of 0 in f, thus the gradient of f must be perpendicular
         # alternative: changing value of f is steepest along the direction perpendicular, each level set is a nested
         # ellipsoid inside or outside of the one defined here.
+        xp = cp if self.use_gpu and has_gpu else np
         p = xyz - self.c  # broadcasting happens because last dimension matches
-        scale = np.array([self.b**2, self.b**2, self.a**2])
+        scale = xp.array([self.b**2, self.b**2, self.a**2])
         grad_f = self.solution * 2 * p / scale  # direction of normal vector doesn't *really* matter, but nice to have
-        grad_f /= np.linalg.norm(grad_f, axis=1, keepdims=True)
+        grad_f /= xp.linalg.norm(grad_f, axis=1, keepdims=True)
         return grad_f
 
 
@@ -285,6 +393,19 @@ class Hyperboloid(Mirror):
         self.c[2] += a
         self.v = vertex
         self.slice = slice
+        self.use_gpu = False
+
+    def to_gpu(self):
+        self.use_gpu = True
+        self.v = to_gpu(self.v)
+        self.c = to_gpu(self.c)
+        self.slice.to_gpu()
+
+    def to_cpu(self):
+        self.use_gpu = False
+        self.v = to_cpu(self.v)
+        self.c = to_cpu(self.c)
+        self.slice.to_cpu()
 
     def intersect(self, rays: "Rays"):
         """
@@ -297,6 +418,7 @@ class Hyperboloid(Mirror):
         :param rays: A point that the ray passes through
         :return: The intersection point of the ray with the hyperboloid
         """
+        xp = cp if self.use_gpu and has_gpu else np
         root = rays.root
         direction = rays.direction
         # transform coordinates to be centered on hyperboloid's center
@@ -308,35 +430,35 @@ class Hyperboloid(Mirror):
         dz = direction[:, 2]
         # symmetric about the z axis, so x and y treated together
         # 0 = 1 - z^2/a^2 + r^2/b^2 -- where r^2 = x^2 + y^2, and x,y,z at parameter t => p + t*d
-        a = np.sum(dxy * dxy, axis=1) / self.b**2 - np.square(dz) / self.a**2
-        b = 2.0 * (np.sum(dxy * xy, axis=1) / self.b**2 - dz * z / self.a**2)
-        c = np.sum(xy * xy, axis=1) / self.b**2 - np.square(z) / self.a**2 + 1.0
+        a = xp.sum(dxy * dxy, axis=1) / self.b**2 - xp.square(dz) / self.a**2
+        b = 2.0 * (xp.sum(dxy * xy, axis=1) / self.b**2 - dz * z / self.a**2)
+        c = xp.sum(xy * xy, axis=1) / self.b**2 - xp.square(z) / self.a**2 + 1.0
         # single intersection case is not needed since hyperboloid always has 2 intersections (may be degenerate)
-        t = np.zeros((root.shape[0], 2, 1))
+        t = xp.zeros((root.shape[0], 2, 1))
         discrm = b * b - 4 * a * c
         # clip the discriminant to 0 to avoid complex roots
-        t[:, 0, 0] = (-b - np.sqrt(discrm.clip(min=0))) / (2 * a)
-        t[:, 1, 0] = (-b + np.sqrt(discrm.clip(min=0))) / (2 * a)
+        t[:, 0, 0] = (-b - xp.sqrt(discrm.clip(min=0))) / (2 * a)
+        t[:, 1, 0] = (-b + xp.sqrt(discrm.clip(min=0))) / (2 * a)
         intn = direction[:, None] * t + p[:, None]  # Intersection point in transformed coordinates
 
         # setting all coordinates to infinity where the discriminant is negative should ensure it misses the slice
-        intn[discrm < 0, :] = np.inf
+        intn[discrm < 0, :] = xp.inf
         # if the sign of the solution doesn't match the convexity of the hyperboloid, ensure it misses the slice
-        correct_sign = np.sign(intn[..., 2]) == self.solution
-        intn[~correct_sign, :] = np.inf
+        correct_sign = xp.sign(intn[..., 2]) == self.solution
+        intn[~correct_sign, :] = xp.inf
 
         all_xyz = intn + self.c[None, None]
         hits = self.slice.in_bounds(all_xyz)
 
         # if the ray would hit the paraboloid at negative t but is already rooted, ignore it (with a small tolerance)
-        behind = np.logical_and(rays.rooted[:, None, None], t < 1e-6)
-        t[behind] = np.inf
+        behind = xp.logical_and(rays.rooted[:, None, None], t < 1e-6)
+        t[behind] = xp.inf
 
         # Now choose the closest valid intersection
-        min_t = np.min(np.where(hits[..., None], t, np.inf), axis=1)
+        min_t = xp.min(xp.where(hits[..., None], t, xp.inf), axis=1)
         result = direction * min_t + root
-        no_hits = ~np.any(hits & ~behind[..., 0], axis=1)
-        result[no_hits, :] = np.nan
+        no_hits = ~xp.any(hits & ~behind[..., 0], axis=1)
+        result[no_hits, :] = xp.nan
         return min_t.ravel(), result
 
     def normal(self, xyz):
@@ -351,10 +473,11 @@ class Hyperboloid(Mirror):
         # intuition: moving along tangent plane gives a change of 0 in f, thus the gradient of f must be perpendicular
         # alternative: changing value of f is steepest along the direction perpendicular, each level set is a nested
         # hyperboloid inside or outside of the one defined here.
+        xp = cp if self.use_gpu and has_gpu else np
         p = xyz - self.c  # broadcasting happens because last dimension matches
-        scale = np.array([self.b**2, self.b**2, -self.a**2])  # note -ve sign on z
+        scale = xp.array([self.b**2, self.b**2, -self.a**2])  # note -ve sign on z
         grad_f = self.solution * 2 * p / scale  # direction of normal vector doesn't *really* matter, but nice to have
-        grad_f /= np.linalg.norm(grad_f, axis=1, keepdims=True)
+        grad_f /= xp.linalg.norm(grad_f, axis=1, keepdims=True)
         return grad_f
 
 
@@ -381,6 +504,15 @@ class ConicSection(Mirror):
                 neg = near_focus
                 pos = -c - near_focus  # mirrored about the center
             self.mirror = Hyperboloid(pos, neg, vertex, slice)
+        self.use_gpu = False
+
+    def to_gpu(self):
+        self.use_gpu = True
+        self.mirror.to_gpu()
+
+    def to_cpu(self):
+        self.use_gpu = False
+        self.mirror.to_cpu()
 
     def intersect(self, rays: "Rays"):
         return self.mirror.intersect(rays)
@@ -395,6 +527,19 @@ class Plane(Mirror):
         self.v = vertex
         self.n = normal / np.linalg.norm(normal)
         self.slice = slice
+        self.use_gpu = False
+
+    def to_gpu(self):
+        self.use_gpu = True
+        self.v = to_gpu(self.v)
+        self.n = to_gpu(self.n)
+        self.slice.to_gpu()
+
+    def to_cpu(self):
+        self.use_gpu = False
+        self.v = to_cpu(self.v)
+        self.n = to_cpu(self.n)
+        self.slice.to_cpu()
 
     def intersect(self, rays: "Rays"):
         """
@@ -406,14 +551,15 @@ class Plane(Mirror):
         :param direction: The unit vector that points in the direction of the ray
         :return: The intersection point of the ray with the plane
         """
+        xp = cp if self.use_gpu and has_gpu else np
         xyz = rays.root
         direction = rays.direction
         t = -(xyz - self.v[None]) @ self.n / (direction @ self.n)
         new_xyz = direction * t[:, None] + xyz
         hits = self.slice.in_bounds(new_xyz[:, None])
-        no_hit = np.full_like(xyz, np.nan)
-        t[~hits.ravel()] = np.inf
-        return t, np.where(hits, new_xyz, no_hit)
+        no_hit = xp.full_like(xyz, xp.nan)
+        t[~hits.ravel()] = xp.inf
+        return t, xp.where(hits, new_xyz, no_hit)
 
     def normal(self, xyz: np.ndarray):
         """
@@ -422,7 +568,8 @@ class Plane(Mirror):
         :param xyz: The point at which to calculate the normal vector
         :return: The normal vector of the plane
         """
-        return np.repeat(self.n[None], xyz.shape[0], axis=0)
+        xp = cp if self.use_gpu and has_gpu else np
+        return xp.repeat(self.n[None], xyz.shape[0], axis=0)
 
 
 class Rays:
@@ -451,6 +598,27 @@ class Rays:
         self.terminates = np.full_like(self.rooted, False)
         self.min_t = np.full_like(self.rooted, np.inf, dtype=float)
         self.blocked_terminus = np.full_like(self.root, np.nan)
+        self.use_gpu = False
+
+    def to_gpu(self):
+        self.use_gpu = True
+        self.root = to_gpu(self.root)
+        self.direction = to_gpu(self.direction)
+        self.terminus = to_gpu(self.terminus)
+        self.rooted = to_gpu(self.rooted)
+        self.terminates = to_gpu(self.terminates)
+        self.min_t = to_gpu(self.min_t)
+        self.blocked_terminus = to_gpu(self.blocked_terminus)
+
+    def to_cpu(self):
+        self.use_gpu = False
+        self.root = to_cpu(self.root)
+        self.direction = to_cpu(self.direction)
+        self.terminus = to_cpu(self.terminus)
+        self.rooted = to_cpu(self.rooted)
+        self.terminates = to_cpu(self.terminates)
+        self.min_t = to_cpu(self.min_t)
+        self.blocked_terminus = to_cpu(self.blocked_terminus)
 
     def reflect(self, mirror: Mirror):
         """
@@ -463,20 +631,22 @@ class Rays:
         :param mirror: The mirror object that the rays will reflect off.
         :return: A new Rays object representing the reflected rays.
         """
+        assert mirror.use_gpu == self.use_gpu
+        xp = cp if self.use_gpu and has_gpu else np
         mirror_t, new_root = mirror.intersect(self)
 
         # figure out if any of the rays were blocked
         is_blocked = mirror_t > self.min_t
         self.terminus[is_blocked, :] = self.blocked_terminus[is_blocked, :]
-        self.terminates = ~np.any(np.isnan(self.terminus), axis=1)
+        self.terminates = ~xp.any(xp.isnan(self.terminus), axis=1)
 
         # Only set the terminus for rays that haven't already terminated, usually the ones that were blocked
-        new_root[self.terminates, :] = np.nan
+        new_root[self.terminates, :] = xp.nan
 
         self.terminus[~self.terminates, :] = new_root[~self.terminates, :]
-        self.terminates = ~np.any(np.isnan(new_root), axis=1) | self.terminates
+        self.terminates = ~xp.any(xp.isnan(new_root), axis=1) | self.terminates
         normals = mirror.normal(new_root)
-        new_direction = self.direction - 2.0 * np.sum(normals * self.direction, axis=1, keepdims=True) * normals
+        new_direction = self.direction - 2.0 * xp.sum(normals * self.direction, axis=1, keepdims=True) * normals
         return Rays(new_root, new_direction, self.terminates)
 
     def test_block(self, object: Mirror):
@@ -490,16 +660,29 @@ class Rays:
 
         :param object: The mirror object to test against the rays.
         """
+        assert object.use_gpu == self.use_gpu
+        xp = cp if self.use_gpu and has_gpu else np
         t, root = object.intersect(self)
         less_than = t < self.min_t
         self.blocked_terminus[less_than, :] = root[less_than, :]
-        self.min_t = np.minimum(self.min_t, t)
+        self.min_t = xp.minimum(self.min_t, t)
 
 
 class BoundingBox:
     def __init__(self, min: np.ndarray, max: np.ndarray):
         self.min = min
         self.max = max
+        self.use_gpu = False
+
+    def to_gpu(self):
+        self.use_gpu = True
+        self.min = to_gpu(self.min)
+        self.max = to_gpu(self.max)
+
+    def to_cpu(self):
+        self.use_gpu = False
+        self.min = to_cpu(self.min)
+        self.max = to_cpu(self.max)
 
     def bound_rays(self, rays: Rays):
         """
@@ -521,44 +704,59 @@ class BoundingBox:
 
         :param rays: The rays to be bounded.
         """
-        bounds = np.concatenate((np.diag(self.min), np.diag(self.max)), axis=0)[None]
-        norms = np.concatenate((np.eye(3), -np.eye(3)), axis=0)
+        assert rays.use_gpu == self.use_gpu
+        xp = cp if self.use_gpu and has_gpu else np
+        bounds = xp.concatenate((xp.diag(self.min), xp.diag(self.max)), axis=0)[None]
+        norms = xp.concatenate((xp.eye(3), -xp.eye(3)), axis=0)
 
         # parameter t for intersection, t = 0 is the root, t = 1 is 1 unit along direction
-        denom = np.einsum("ik,jk->ij", rays.direction, norms)
-        t = -np.einsum("ijk,jk->ij", rays.root[:, None] - bounds, norms) / denom
-        t[denom == 0] = np.nan
+        denom = xp.einsum("ik,jk->ij", rays.direction, norms)
+        t = -xp.einsum("ijk,jk->ij", rays.root[:, None] - bounds, norms) / denom
+        t[denom == 0] = xp.nan
 
         # away: when true, rooting is possible. If parallel, always false
         # towards: opposite, but still false when parallel - for termination
-        away = np.einsum("jk,ik->ij", norms, rays.direction) > 0
-        towards = np.einsum("jk,ik->ij", norms, rays.direction) < 0
+        away = xp.einsum("jk,ik->ij", norms, rays.direction) > 0
+        towards = xp.einsum("jk,ik->ij", norms, rays.direction) < 0
 
-        possible_roots = np.max(np.where(away, t, -np.inf), axis=1)
-        possible_termini = np.min(np.where(towards, t, np.inf), axis=1)
+        possible_roots = xp.max(xp.where(away, t, -xp.inf), axis=1)
+        possible_termini = xp.min(xp.where(towards, t, xp.inf), axis=1)
         new_roots = rays.root + rays.direction * possible_roots[:, None]
         new_termini = rays.root + rays.direction * possible_termini[:, None]
-        rays.root = np.where(rays.rooted[:, None], rays.root, new_roots)
-        rays.terminus = np.where(rays.terminates[:, None], rays.terminus, new_termini)
+        rays.root = xp.where(rays.rooted[:, None], rays.root, new_roots)
+        rays.terminus = xp.where(rays.terminates[:, None], rays.terminus, new_termini)
         # rays must always terminate
         rays.rooted[...] = True
         rays.terminates[...] = True
 
 
 class Simulation:
-    def __init__(self, bounding_box: BoundingBox, objects: list[Mirror]):
+    def __init__(self, bounding_box: BoundingBox, objects: list[Mirror], use_gpu: bool = True):
         self.bounding_box = bounding_box
         self.objects = objects
         self.finished_rays = []
+        self.use_gpu = use_gpu
 
     def trace(self, sources: list[Rays]):
         propagate = sources
+
+        # transfer to gpu if necessary
+        if self.use_gpu:
+            self.bounding_box.to_gpu()
+            for source in propagate:
+                source.to_gpu()
+            for obj in self.objects:
+                obj.to_gpu()
+
         for idx, obj in enumerate(self.objects):
             for jdx, source in enumerate(propagate):
                 if idx < len(self.objects) - 1:
                     for blocker in self.objects[idx + 1 :]:
                         source.test_block(blocker)
-                propagate[jdx] = source.reflect(obj)
+                new_rays = source.reflect(obj)
+                if self.use_gpu:
+                    new_rays.to_gpu()
+                propagate[jdx] = new_rays
                 self.bounding_box.bound_rays(source)
                 self.finished_rays.append(source)
 
@@ -566,30 +764,47 @@ class Simulation:
             self.bounding_box.bound_rays(source)
             self.finished_rays.append(source)
 
+        # transfer back to cpu if necessary
+        if self.use_gpu:
+            self.bounding_box.to_cpu()
+            for obj in self.objects:
+                obj.to_cpu()
+            for source in self.finished_rays:
+                source.to_cpu()
+
     def render(
         self,
         num_sources: int,
         detector_plane: Plane,
         detector_vertical: np.ndarray,
         c: np.ndarray = None,
+        use_opengl: bool = False,
         render_final: bool = False,
     ):
-        fig = plt.figure()
-        ax = fig.add_subplot(projection="3d")
-        if render_final:
-            bundles = self.finished_rays
+        vis_app = None
+        if use_opengl:
+            n_obj = len(self.objects)
+            n_render = (n_obj + (1 if render_final else 0)) * num_sources
+            vis_app = VisualizerApp.from_bundles(self.finished_rays[:n_render], c)
+            vis_app.start()
         else:
-            bundles = self.finished_rays[:-num_sources]
-        for bundle in bundles[::-1]:
-            lines = np.stack((bundle.root, bundle.terminus), axis=1)
-            line_collection = Line3DCollection(lines, colors=c, linewidths=1)
-            ax.add_collection(line_collection)
-        ax.set_xlim(self.bounding_box.min[0], self.bounding_box.max[0])
-        ax.set_ylim(self.bounding_box.min[1], self.bounding_box.max[1])
-        ax.set_zlim(self.bounding_box.min[2], self.bounding_box.max[2])
-        # set axes equal
-        ax.set_aspect("equal")
-        plt.show()
+            fig = plt.figure()
+            ax = fig.add_subplot(projection="3d")
+            if render_final:
+                bundles = self.finished_rays
+            else:
+                bundles = self.finished_rays[:-num_sources]
+            for bundle in bundles[::-1]:
+                lines = np.stack((bundle.root, bundle.terminus), axis=1)
+                # TODO: this will not work if the bundles are not all the same size
+                line_collection = Line3DCollection(lines, colors=c, linewidths=1)
+                ax.add_collection(line_collection)
+            ax.set_xlim(self.bounding_box.min[0], self.bounding_box.max[0])
+            ax.set_ylim(self.bounding_box.min[1], self.bounding_box.max[1])
+            ax.set_zlim(self.bounding_box.min[2], self.bounding_box.max[2])
+            # set axes equal
+            ax.set_aspect("equal")
+            plt.show()
 
         # project the roots of the rays onto the detector plane and plot
         vertical = detector_vertical - detector_vertical @ detector_plane.n * detector_plane.n
@@ -616,3 +831,10 @@ class Simulation:
         ax.set_xlim(detector_plane.slice.xmin, detector_plane.slice.xmax)
         ax.set_ylim(detector_plane.slice.ymin, detector_plane.slice.ymax)
         plt.show()
+
+        # keep the opengl visualization alive until the user closes it intentionally
+        try:
+            while vis_app is not None and vis_app.running:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            vis_app.stop()

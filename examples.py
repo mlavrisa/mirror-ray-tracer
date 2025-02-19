@@ -5,12 +5,12 @@ from ray_tracer import (
     BoundingBox,
     CircularSlice,
     ConicSection,
-    Paraboloid,
     Ellipsoid,
     Hyperboloid,
+    Paraboloid,
     Plane,
-    RectangularSlice,
     Rays,
+    RectangularSlice,
     Simulation,
 )
 
@@ -30,7 +30,7 @@ def on_axis_newt():
 
     sim = Simulation(BoundingBox(np.array([-r, -r, -1.0]), np.array([r, r, max(h, f) * 1.5])), [primary, detector])
 
-    mirror_scatter = primary_slice.scatter(0.0049, concentric=True)
+    mirror_scatter = primary_slice.scatter(0.0149, concentric=True)
 
     colours = hsv_to_rgb(
         np.stack(
@@ -81,10 +81,12 @@ def ritchey_chretien():
     detector = Plane(np.array([0.0, 0.0, 0.154]), np.array([0.0, 0.0, -1.0]), detector_slice)
 
     sim = Simulation(
-        BoundingBox(np.array([-r1, -r1, -1.0]), np.array([r1, r1, max(h, b) * 1.5])), [primary, secondary, detector]
+        BoundingBox(np.array([-r1, -r1, -1.0]), np.array([r1, r1, max(h, b) * 1.5])),
+        [primary, secondary, detector],
+        use_gpu=False,
     )
 
-    mirror_scatter = primary_slice.scatter(0.0749, concentric=True)
+    mirror_scatter = primary_slice.scatter(0.0149, concentric=True)
 
     colours = hsv_to_rgb(
         np.stack(
@@ -104,7 +106,7 @@ def ritchey_chretien():
     off_ax_rays = Rays(off_ax_roots, np.array([off_center_angle, 0, -1.0]))
     sources = [incid_rays, off_ax_rays]
     sim.trace(sources)
-    sim.render(len(sources), detector, np.array([0.0, 1.0, 0.0]), colours)
+    sim.render(len(sources), detector, np.array([0.0, 1.0, 0.0]), colours, use_opengl=True)
 
 
 if __name__ == "__main__":
