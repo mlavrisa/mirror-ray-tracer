@@ -46,11 +46,11 @@ def on_axis_newt():
     off_center_angle = np.arctan(1 / 235.0)
     incid_roots = np.concatenate((mirror_scatter, np.full((mirror_scatter.shape[0], 1), 5.0)), axis=1)
     incid_rays = Rays(incid_roots, np.array([0, 0, -1.0]))
-    off_ax_roots = primary.intersect(incid_rays)  # This does not modify incident rays, only reflect does
+    _, off_ax_roots = primary.intersect(incid_rays)  # This does not modify incident rays, only reflect does
     off_ax_rays = Rays(off_ax_roots, np.array([off_center_angle, 0, -1.0]))
     sources = [incid_rays, off_ax_rays]
     sim.trace(sources)
-    sim.render(len(sources), detector, np.array([0.0, 1.0, 0.0]), colours)
+    sim.render(len(sources), detector, np.array([0.0, 1.0, 0.0]), colours, True)
 
 
 def ritchey_chretien():
@@ -110,4 +110,4 @@ def ritchey_chretien():
 
 
 if __name__ == "__main__":
-    ritchey_chretien()
+    on_axis_newt()
